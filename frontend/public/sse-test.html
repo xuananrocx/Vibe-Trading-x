@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html>
+<head><title>SSE Test</title></head>
+<body>
+<h2>SSE Connection Test</h2>
+<div id="log" style="font-family:monospace; font-size:12px; white-space:pre; max-height:80vh; overflow:auto; border:1px solid #ccc; padding:10px;"></div>
+<script>
+const logEl = document.getElementById('log');
+function log(msg) { logEl.textContent += msg + '\n'; logEl.scrollTop = logEl.scrollHeight; }
+
+// Create session
+log('Creating session...');
+fetch('http://localhost:8899/sessions', { method: 'POST', headers: {'Content-Type':'application/json'}, body: '{}' })
+  .then(r => r.json())
+  .then(session => {
+    const sid = session.session_id;
+    log('Session: ' + sid);
+
+    // Connect SSE
+    const sseUrl = 'http://localhost:8899/sessions/' + sid + '/events';
+    log('Connecting SSE to: ' + sseUrl);
+    const es = new EventSource(sseUrl);
+
+    es.onopen = () => log('[SSE] CONNECTED');
+    es.onerror = (e) => log('[SSE] ERROR: ' + JSON.stringify(e.type));
+
+    const types = ['message.received','attempt.created','attempt.started','text_delta','tool_call','tool_result','llm_usage','attempt.completed','attempt.failed','heartbeat'];
+    types.forEach(t => es.addEventListener(t, (e) => log('[SSE] ' + t + ': ' + e.data.slice(0,200))));
+
+    // Send message after delay
+    setTimeout(() => {
+      log('Sending message...');
+      fetch('http://localhost:8899/sessions/' + sid + '/messages', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({content: '你好'})
+      }).then(r => r.json()).then(d => log('Message sent: ' + JSON.stringify(d)));
+    }, 1000);
+  })
+  .catch(e => log('ERROR: ' + e.message));
+</script>
+</body>
+</html>

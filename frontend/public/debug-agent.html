@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html>
+<head><title>Agent Debug</title></head>
+<body style="font-family:monospace; padding:20px; background:#1a1a2e; color:#eee;">
+<h2>Agent SSE Debug</h2>
+<div id="log" style="white-space:pre-wrap; font-size:12px; max-height:600px; overflow-y:auto; background:#000; padding:10px; border-radius:8px;"></div>
+<div id="state" style="margin-top:10px; padding:10px; background:#222; border-radius:8px;"></div>
+<input id="msg" placeholder="Type message..." style="width:60%; padding:8px; margin-top:10px;">
+<button onclick="sendMsg()" style="padding:8px 16px;">Send</button>
+
+<script>
+const API = 'http://localhost:8899';
+let sessionId = null;
+let eventSource = null;
+let messages = [];
+let status = 'idle';
+let streamingText = '';
+let toolCalls = [];
+
+function log(msg, color) {
+  const el = document.getElementById('log');
+  const line = document.createElement('div');
+  line.style.color = color || '#eee';
+  line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+
+function updateState() {
+  document.getElementById('state').innerHTML =
+    `<b>Session:</b> ${sessionId || 'none'}<br>` +
+    `<b>Status:</b> ${status}<br>` +
+    `<b>Messages:</b> ${messages.length}<br>` +
+    `<b>StreamingText:</b> "${streamingText.slice(0, 80)}"<br>` +
+    `<b>ToolCalls:</b> ${toolCalls.length}`;
+}
+
+function setupSSE(sid) {
+  if (eventSource) eventSource.close();
+  const url = `${API}/sessions/${sid}/events`;
+  log(`Connecting SSE: ${url}`, 'cyan');
+  eventSource = new EventSource(url);
+
+  eventSource.onopen = () => log('SSE CONNECTED', 'lime');
+
+  const handlerMap = {
+    'text_delta': (d) => { streamingText += String(d.delta || ''); updateState(); },
+    'tool_call': (d) => { toolCalls.push({tool: d.tool, status: 'running'}); log(`Tool call: ${d.tool}`, 'yellow'); updateState(); },
+    'tool_result': (d) => { const tc = toolCalls.find(t => t.tool === d.tool); if (tc) tc.status = d.status; log(`Tool result: ${d.tool} ${d.status}`, d.status === 'ok' ? 'lime' : 'red'); updateState(); },
+    'llm_usage': (d) => { log(`LLM usage: in=${d.input_tokens} out=${d.output_tokens} iter=${d.iter}`, 'gray'); },
+    'attempt.created': () => { status = 'streaming'; log('Attempt CREATED', 'yellow'); updateState(); },
+    'attempt.started': () => { status = 'streaming'; log('Attempt STARTED', 'yellow'); updateState(); },
+    'attempt.completed': (d) => {
+      log(`Attempt COMPLETED: ${String(d.summary || '').slice(0, 100)}...`, 'lime');
+      streamingText = '';
+      toolCalls = [];
+      if (d.summary) messages.push({type: 'answer', content: d.summary});
+      status = 'idle';
+      updateState();
+      log(`Status set to IDLE. Messages: ${messages.length}`, 'lime');
+    },
+    'attempt.failed': (d) => {
+      log(`Attempt FAILED: ${d.error}`, 'red');
+      status = 'idle';
+      updateState();
+    },
+    'message.received': (d) => { log(`Message received: ${d.content}`, 'cyan'); },
+    'heartbeat': () => {},
+  };
+
+  for (const [type, handler] of Object.entries(handlerMap)) {
+    eventSource.addEventListener(type, (e) => {
+      let data;
+      try { data = JSON.parse(e.data); } catch { data = {}; }
+      log(`[SSE] ${type}: ${JSON.stringify(data).slice(0, 100)}`, '#888');
+      handler(data);
+    });
+  }
+
+  eventSource.onerror = (e) => { log(`SSE ERROR: ${JSON.stringify(e)}`, 'red'); };
+}
+
+async function sendMsg() {
+  const input = document.getElementById('msg');
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = '';
+
+  status = 'streaming';
+  messages.push({type: 'user', content: text});
+  updateState();
+  log(`Sending: "${text}"`, 'cyan');
+
+  try {
+    if (!sessionId) {
+      const resp = await fetch(`${API}/sessions`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+      const data = await resp.json();
+      sessionId = data.session_id;
+      log(`Created session: ${sessionId}`, 'cyan');
+      setupSSE(sessionId);
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    const resp = await fetch(`${API}/sessions/${sessionId}/messages`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({content: text})
+    });
+    const data = await resp.json();
+    log(`Message sent: ${JSON.stringify(data)}`, 'cyan');
+  } catch (err) {
+    log(`Error: ${err.message}`, 'red');
+    status = 'idle';
+    updateState();
+  }
+}
+
+document.getElementById('msg').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') sendMsg();
+});
+
+log('Ready. Type a message and press Enter.', 'lime');
+updateState();
+</script>
+</body>
+</html>

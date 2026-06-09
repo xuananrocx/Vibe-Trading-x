@@ -155,6 +155,26 @@
       </div>
     </td>
   </tr>
+  <tr>
+    <td align="center" width="50%" valign="top">
+      <img src="assets/feature-shadow-account.png" height="130" alt="Multilingual Interface"/><br>
+      <h3>🌐 中英文界面切换</h3>
+      <div align="left">
+        • 完整的 i18n 支持，侧边栏语言切换按钮<br>
+        • 支持简体中文和英文界面<br>
+        • 所有页面和组件已本地化
+      </div>
+    </td>
+    <td align="center" width="50%" valign="top">
+      <img src="assets/feature-shadow-account.png" height="130" alt="AI Logging & Real-time Streaming"/><br>
+      <h3>📋 AI 日志与实时流式显示</h3>
+      <div align="left">
+        • 完整的 LLM 交互日志记录和查看功能<br>
+        • 修复 SSE 实时流式显示，不再卡顿<br>
+        • 支持逐轮日志写入和"进行中"状态显示
+      </div>
+    </td>
+  </tr>
 </table>
 </div>
 

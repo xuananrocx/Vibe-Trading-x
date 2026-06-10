@@ -399,7 +399,7 @@ export function Agent() {
   }, [forceScrollToBottom]);
 
   const setupSSE = useCallback((sid: string) => {
-    if (sseSessionRef.current === sid) return;
+    // Always reconnect — old EventSource may be in a bad state after previous attempt
     disconnect();
     sseSessionRef.current = sid;
 
@@ -407,12 +407,11 @@ export function Agent() {
 
     connect(api.sseUrl(sid, { replay: "active" }), {
       text_delta: (d) => { touch(); act().appendDelta(String(d.delta || "")); scrollToBottom(); },
-      thinking_done: () => { touch(); /* don't flush — keep streaming text visible */ },
+      thinking_done: () => { touch(); },
 
       tool_call: (d) => {
         touch();
         const toolName = String(d.tool || "");
-        // Only update toolCalls tracker (no message creation during streaming)
         act().addToolCall({
           id: toolName, tool: toolName,
           arguments: (d.arguments as Record<string, string>) ?? {},
@@ -424,9 +423,7 @@ export function Agent() {
       tool_result: (d) => {
         touch();
         const toolName = String(d.tool || "");
-        // Drop any in-flight coalesced progress for this tool.
         pendingProgressRef.current.delete(toolName);
-        // Only update tracker (no message creation during streaming)
         act().updateToolCall(toolName, {
           status: d.status === "ok" ? "ok" : "error",
           preview: String(d.preview || ""),
@@ -438,7 +435,6 @@ export function Agent() {
 
       tool_heartbeat: (d) => {
         touch();
-        // Keep streaming state alive during long-running tools (swarm, backtest)
         if (act().status !== "streaming") act().setStatus("streaming");
         const toolName = String(d.tool || "");
         if (!toolName) return;
@@ -456,7 +452,6 @@ export function Agent() {
         if (typeof d.message === "string" && d.message) payload.message = d.message;
         if (typeof d.current === "number") payload.current = d.current;
         if (typeof d.total === "number") payload.total = d.total;
-        // Coalesce: keep latest payload per tool, flush once per animation frame.
         pendingProgressRef.current.set(toolName, payload);
         if (progressRafRef.current) return;
         progressRafRef.current = requestAnimationFrame(() => {
@@ -475,73 +470,21 @@ export function Agent() {
 
       "attempt.created": () => {
         touch();
-        console.log("[Agent] attempt.created received");
-        // Backend has created a new attempt — ensure streaming state is active
-        // even if we connected mid-stream (SSE replay / page reload).
         if (act().status !== "streaming") act().setStatus("streaming");
       },
 
       "attempt.started": () => {
         touch();
-        console.log("[Agent] attempt.started received");
-        // Backend has begun executing the attempt. Re-affirm streaming state
-        // so the UI shows a working indicator for reconnects and fresh loads.
         if (act().status !== "streaming") act().setStatus("streaming");
       },
 
-      "attempt.completed": async (d) => {
+      "attempt.completed": () => {
         touch();
-
-        // IMMEDIATELY reset streaming state (synchronous, no async before this)
-        const s = act();
-        const completedTools = [...s.toolCalls];
-
-        // Clear streaming text + status + toolCalls in one batch to minimize renders
-        useAgentStore.setState({
-          streamingText: "",
-          status: "idle",
-          toolCalls: [],
-        });
-
-        // Build new messages array in one shot
-        const newMsgs: AgentMessage[] = [];
-        for (const tc of completedTools) {
-          newMsgs.push({ id: tc.id + "_call", type: "tool_call", content: "", tool: tc.tool, args: tc.arguments, status: tc.status || "ok", timestamp: tc.timestamp });
-          if (tc.elapsed_ms != null) {
-            newMsgs.push({ id: `tr_${tc.tool}_${tc.timestamp}`, type: "tool_result", content: tc.preview || "", tool: tc.tool, status: tc.status || "ok", elapsed_ms: tc.elapsed_ms, timestamp: tc.timestamp + 1 });
-          }
-        }
-        const summary = String(d.summary || "");
-        if (summary) {
-          newMsgs.push({ id: `ans_${Date.now()}`, type: "answer" as const, content: summary, timestamp: Date.now() });
-        }
-
-        // Append all messages at once
-        if (newMsgs.length > 0) {
-          useAgentStore.setState((prev) => ({
-            messages: [...prev.messages, ...newMsgs],
-          }));
-        }
-
-        scrollToBottom();
-
-        // Run card: fire-and-forget, non-blocking
-        const runDir = String(d.run_dir || "");
-        const runId = runDir ? runDir.split(/[/\\]/).pop() : undefined;
-        if (runId) {
-          api.getRun(runId)
-            .then((runData) => {
-              if (isReportWorthyRun(runData)) {
-                act().addMessage({
-                  id: "", type: "run_complete", content: "", runId,
-                  metrics: runData.metrics,
-                  equityCurve: runData.equity_curve?.map(e => ({ time: e.time, equity: Number(e.equity) })),
-                  timestamp: Date.now(),
-                });
-              }
-            })
-            .catch(() => {});
-        }
+        // Don't update status here — let the polling fallback handle the final
+        // state transition. SSE setState calls don't reliably trigger React
+        // re-renders from EventSource callbacks, but polling via setInterval does.
+        // Just clear streaming visuals.
+        useAgentStore.setState({ streamingText: "", toolCalls: [] });
       },
 
       "attempt.failed": (d) => {
@@ -549,21 +492,12 @@ export function Agent() {
         act().clearStreaming();
         act().addMessage({ id: "", type: "error", content: String(d.error || "Execution failed"), timestamp: Date.now() });
         act().setStatus("idle");
-        // Clear stale toolCalls so the next turn's running indicator doesn't
-        // briefly show the previous turn's progress before fresh events land.
         useAgentStore.setState({ toolCalls: [] });
         scrollToBottom();
       },
 
-      "goal.created": () => {
-        touch();
-        loadGoalSnapshot(sid);
-      },
-
-      "goal.evidence": () => {
-        touch();
-        loadGoalSnapshot(sid);
-      },
+      "goal.created": () => { touch(); loadGoalSnapshot(sid); },
+      "goal.evidence": () => { touch(); loadGoalSnapshot(sid); },
 
       "goal.updated": (d) => {
         touch();
@@ -575,10 +509,7 @@ export function Agent() {
           setGoalEditActive(false);
           return;
         }
-        if (snapshot) {
-          setGoalSnapshot(snapshot);
-          return;
-        }
+        if (snapshot) { setGoalSnapshot(snapshot); return; }
         loadGoalSnapshot(sid);
       },
 
@@ -595,7 +526,6 @@ export function Agent() {
         const committed = d as unknown as MandateCommitted;
         if (!committed.proposal_id) return;
         setCommittedMandates((prev) => ({ ...prev, [committed.proposal_id as string]: committed }));
-        // A fresh mandate may bring up the runner; refresh the runtime panel now.
         setLiveStatusRefresh((n) => n + 1);
         scrollToBottom();
       },
@@ -603,9 +533,6 @@ export function Agent() {
       "live.halted": (d) => {
         touch();
         const halted = d as unknown as LiveHalted;
-        // Preemptive kill switch: the server has cancelled resting orders and may have
-        // flattened positions (SPEC §7.5 #6). Reflect the halted state across surfaces;
-        // the RunnerStatus panel re-polls so its per-broker rows show "halted".
         setLiveHalted(halted);
         setLiveStatusRefresh((n) => n + 1);
         toast.warning(t("agent.connectorHalted"));
@@ -613,8 +540,6 @@ export function Agent() {
 
       "live.resumed": (d) => {
         touch();
-        // Kill switch cleared via a privileged surface action (SPEC Consent §4);
-        // clear the halted banner and re-poll runtime status.
         void d;
         setLiveHalted(null);
         setLiveStatusRefresh((n) => n + 1);
@@ -628,7 +553,6 @@ export function Agent() {
         setLiveItems((items) => [...items, { kind: "live_action", timestamp: Date.now(), action }]);
         if (action.kind === "halt_tripped") setLiveHalted({ broker: action.broker, reason: action.intent_normalized });
         if (action.kind === "halt_cleared") setLiveHalted(null);
-        // Mandate-affecting / runner-affecting actions should refresh the runtime panel.
         if (["mandate_committed", "halt_tripped", "halt_cleared"].includes(action.kind)) {
           setLiveStatusRefresh((n) => n + 1);
         }
@@ -739,6 +663,52 @@ export function Agent() {
     }, 10_000);
     return () => clearInterval(timer);
   }, [status]);
+
+  /* Polling: primary display mechanism for completed messages.
+   * Polls every 1.5s while streaming. When backend has an assistant message,
+   * rebuilds the full message list from the API response and forces UI update.
+   * This is MORE reliable than SSE setState for triggering React re-renders. */
+  useEffect(() => {
+    if (status !== "streaming") return;
+    const timer = setInterval(() => {
+      const sid = act().sessionId;
+      if (!sid) return;
+      api.getSessionMessages(sid).then((msgs) => {
+        // Check if there's a final assistant message
+        const lastAssistant = [...msgs].reverse().find(m => m.role === "assistant");
+        if (!lastAssistant) return; // Still processing
+        // Rebuild messages from API response — this is the source of truth
+        const agentMsgs: AgentMessage[] = [];
+        for (const m of msgs) {
+          const meta = m.metadata as Record<string, unknown> | undefined;
+          const runId = meta?.run_id as string | undefined;
+          const metrics = meta?.metrics as Record<string, number> | undefined;
+          const ts = new Date(m.created_at).getTime();
+          if (m.role === "user") {
+            agentMsgs.push({ id: m.message_id, type: "user", content: m.content, timestamp: ts });
+          } else if (runId) {
+            if (m.content && m.content !== "Strategy execution completed.") {
+              agentMsgs.push({ id: m.message_id + "_ans", type: "answer", content: m.content, timestamp: ts });
+            }
+            if (metrics && Object.keys(metrics).length > 0) {
+              agentMsgs.push({ id: m.message_id, type: "run_complete", content: "", runId, metrics, timestamp: ts + 1 });
+            }
+          } else {
+            agentMsgs.push({ id: m.message_id, type: "answer", content: m.content, timestamp: ts });
+          }
+        }
+        // Force update: replace ALL messages and set idle
+        useAgentStore.setState({
+          messages: agentMsgs,
+          streamingText: "",
+          status: "idle",
+          toolCalls: [],
+        });
+        scrollToBottom();
+      }).catch(() => {});
+    }, 1500);
+    return () => clearInterval(timer);
+  }, [status, scrollToBottom]);
 
   const runPrompt = async (prompt: string) => {
     if (!prompt.trim() || status === "streaming") return;
